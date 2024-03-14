@@ -4,6 +4,7 @@ import inspect
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import importlib.resources
 
 import numpy as np
 import torch
@@ -13,12 +14,13 @@ from sglang.srt.utils import is_multimodal_model
 from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
 import sglang
 
-QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig}
+QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig, "marlin": MarlinConfig}
 
 logger = logging.getLogger("model_runner")
 
@@ -30,10 +32,12 @@ global_server_args_dict: dict = None
 @lru_cache()
 def import_model_classes():
     model_arch_name_to_cls = {}
-    for module_path in (Path(sglang.__file__).parent / "srt" / "models").glob("*.py"):
-        module = importlib.import_module(f"sglang.srt.models.{module_path.stem}")
-        if hasattr(module, "EntryClass"):
-            model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+    for f in importlib.resources.files("sglang.srt.models").iterdir():
+        if f.name.endswith(".py"):
+            module_name = Path(f.name).with_suffix('')
+            module = importlib.import_module(f"sglang.srt.models.{module_name}")
+            if hasattr(module, "EntryClass"):
+                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
     return model_arch_name_to_cls
 
 
@@ -296,9 +300,15 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
                 if hf_quant_config is not None:
-                    quant_config_class = QUANTIONCONFIG_MAPPING.get(
-                        hf_quant_config["quant_method"]
-                    )
+                    hf_quant_method = hf_quant_config["quant_method"]
+
+                    # compat: autogptq uses is_marlin_format within quant config
+                    if (hf_quant_method == "gptq"
+                            and "is_marlin_format" in hf_quant_config
+                            and hf_quant_config["is_marlin_format"]):
+                        hf_quant_method = "marlin"
+                    quant_config_class = QUANTIONCONFIG_MAPPING.get(hf_quant_method)
+
                     if quant_config_class is None:
                         raise ValueError(
                             f"Unsupported quantization method: {hf_quant_config['quant_method']}"
